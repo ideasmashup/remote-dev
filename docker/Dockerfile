@@ -1,7 +1,7 @@
 # Remote Dev - Base Project Container Image
-# For local testing: ubuntu:22.04
+# For local testing without GPU: ubuntu:22.04
 # For production with GPU: nvidia/cuda:12.1.0-devel-ubuntu22.04
-ARG BASE_IMAGE=ubuntu:22.04
+ARG BASE_IMAGE=nvidia/cuda:12.1.0-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
