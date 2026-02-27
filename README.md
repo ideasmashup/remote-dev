@@ -1,6 +1,6 @@
 # Remote Dev
 
-A system to let developers and LLMs work on Python projects inside remote Linux containers on a shared machine with CUDA GPU (H100). Named projects replace raw Docker containers — each project gets its own isolated environment with persistent storage, Python, git, and optional GPU access.
+A system to let developers and LLMs work on Python projects inside remote Linux containers on a shared machine with CUDA GPU. Named projects replace raw Docker containers — each project gets its own isolated environment with persistent storage, Python, git, and optional GPU access.
 
 ## Architecture
 
@@ -30,6 +30,10 @@ graph TD
 - **GPU passthrough** — optional `--gpu` flag for CUDA workloads
 - **Push/pull files** between host and container
 - **Local or remote mode** — test locally, deploy to server via SSH
+
+## Pre-requisites
+
+You must have a working SSH access to the remote host, with git and docker installed on it. Update the `.env` file with the remote host and docker binary path. In our case we use docker context `rootless` to avoid sudo and root permissions. If you don't have this setup, you can use `default` context and run `sudo` commands on the remote host. Just comment or leav empty `RDEV_DOCKER_CONTEXT` in the `.env` file.
 
 ## Quick Start
 
