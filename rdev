@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# rdev — Local developer CLI for Remote Dev
+#
+# Thin wrapper that calls remote-dev.sh either directly (local mode)
+# or via SSH (remote mode).
+# ═══════════════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env if present
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+fi
+
+RDEV_HOST="${RDEV_HOST:-local}"
+RDEV_REMOTE_SCRIPT="${RDEV_REMOTE_SCRIPT:-/opt/remote-dev/remote-dev.sh}"
+
+if [ $# -eq 0 ]; then
+    echo "Usage: rdev <command> [options]"
+    echo ""
+    echo "Run 'rdev help' for available commands."
+    echo ""
+    echo "Mode: ${RDEV_HOST}"
+    exit 0
+fi
+
+if [ "$RDEV_HOST" = "local" ]; then
+    # ── Local mode: call remote-dev.sh directly ──
+    exec "$SCRIPT_DIR/remote-dev.sh" "$@"
+else
+    # ── Remote mode: call remote-dev.sh via SSH ──
+    # For interactive commands (shell), allocate a TTY
+    ssh_args=()
+    case "${1:-}" in
+        shell)
+            ssh_args+=("-t")  # Force TTY allocation
+            ;;
+    esac
+
+    exec ssh "${ssh_args[@]}" "$RDEV_HOST" "$RDEV_REMOTE_SCRIPT" "$@"
+fi
