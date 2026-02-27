@@ -1,0 +1,3 @@
+# ignore local env and projects
+.env
+data/projects/*
