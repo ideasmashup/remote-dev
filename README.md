@@ -109,7 +109,16 @@ RDEV_DATA_DIR=./data/projects    # Where project volumes live on host
 RDEV_IMAGE=rdev-base:latest      # Docker image for containers
 RDEV_HOST=local                  # "local" or "user@host" for SSH mode
 RDEV_DOCKER=docker               # Docker binary path
+RDEV_DOCKER_CONTEXT=             # Docker context (e.g. "rootless")
 ```
+
+### Rootless Docker (Remote Server)
+
+The remote server supports two Docker contexts:
+- **`default`** — root-only, requires sudo
+- **`rootless`** — runs as current user (must be member of `rootlesskit` group)
+
+Set `RDEV_DOCKER_CONTEXT=rootless` in `.env` to use rootless mode. The script injects `--context rootless` into every Docker call automatically. To switch manually: `docker context use rootless` / `docker context use default`.
 
 ## Container Environment
 

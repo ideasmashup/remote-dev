@@ -17,6 +17,7 @@ fi
 RDEV_DATA_DIR="${RDEV_DATA_DIR:-$SCRIPT_DIR/data/projects}"
 RDEV_IMAGE="${RDEV_IMAGE:-rdev-base:latest}"
 RDEV_DOCKER="${RDEV_DOCKER:-docker}"
+RDEV_DOCKER_CONTEXT="${RDEV_DOCKER_CONTEXT:-}"
 RDEV_CONTAINER_PREFIX="rdev"
 RDEV_TEMPLATES_DIR="${RDEV_TEMPLATES_DIR:-$SCRIPT_DIR/templates}"
 
@@ -37,6 +38,15 @@ warn()    { echo -e "${YELLOW}⚠️${NC}  $*"; }
 error()   { echo -e "${RED}❌${NC} $*" >&2; }
 header()  { echo -e "\n${BOLD}${CYAN}═══ $* ═══${NC}\n"; }
 
+# Docker command wrapper — injects --context when RDEV_DOCKER_CONTEXT is set
+docker_cmd() {
+    if [ -n "$RDEV_DOCKER_CONTEXT" ]; then
+        $RDEV_DOCKER --context "$RDEV_DOCKER_CONTEXT" "$@"
+    else
+        $RDEV_DOCKER "$@"
+    fi
+}
+
 container_name() {
     echo "${RDEV_CONTAINER_PREFIX}-${1}"
 }
@@ -50,12 +60,12 @@ ensure_data_dir() {
 }
 
 container_exists() {
-    $RDEV_DOCKER container inspect "$(container_name "$1")" &>/dev/null
+    docker_cmd container inspect "$(container_name "$1")" &>/dev/null
 }
 
 container_running() {
     local state
-    state=$($RDEV_DOCKER container inspect -f '{{.State.Running}}' "$(container_name "$1")" 2>/dev/null)
+    state=$(docker_cmd container inspect -f '{{.State.Running}}' "$(container_name "$1")" 2>/dev/null)
     [ "$state" = "true" ]
 }
 
@@ -137,13 +147,13 @@ cmd_create() {
 
     # Create and start the container
     info "Creating container: $cname"
-    $RDEV_DOCKER "${docker_args[@]}"
+    docker_cmd "${docker_args[@]}"
 
     # If git URL provided, clone repo inside the container
     if [ -n "$git_url" ]; then
         info "Cloning repository: $git_url"
         # Clone into a temp dir inside workspace, then move contents
-        $RDEV_DOCKER exec "$cname" bash -c "
+        docker_cmd exec "$cname" bash -c "
             cd /workspace
             git clone '$git_url' /tmp/_rdev_clone
             # Move everything (including hidden files) from clone to workspace
@@ -153,7 +163,7 @@ cmd_create() {
         "
         # Also copy AGENT.md into cloned projects
         if [ -f "$RDEV_TEMPLATES_DIR/AGENT.md" ]; then
-            $RDEV_DOCKER cp "$RDEV_TEMPLATES_DIR/AGENT.md" "$cname:/workspace/AGENT.md"
+            docker_cmd cp "$RDEV_TEMPLATES_DIR/AGENT.md" "$cname:/workspace/AGENT.md"
         fi
         success "Repository cloned into workspace"
     fi
@@ -203,7 +213,7 @@ cmd_destroy() {
     cname="$(container_name "$name")"
 
     # Stop and remove container
-    $RDEV_DOCKER rm -f "$cname" &>/dev/null || true
+    docker_cmd rm -f "$cname" &>/dev/null || true
     success "Container removed"
 
     # Remove project data
@@ -231,7 +241,7 @@ cmd_start() {
     fi
 
     info "Starting project '$name'..."
-    $RDEV_DOCKER start "$(container_name "$name")"
+    docker_cmd start "$(container_name "$name")"
     success "Project '$name' started"
 }
 
@@ -249,7 +259,7 @@ cmd_stop() {
     fi
 
     info "Stopping project '$name'..."
-    $RDEV_DOCKER stop "$(container_name "$name")"
+    docker_cmd stop "$(container_name "$name")"
     success "Project '$name' stopped"
 }
 
@@ -267,7 +277,7 @@ cmd_shell() {
     fi
 
     info "Opening shell for project '$name'..."
-    $RDEV_DOCKER exec -it "$(container_name "$name")" bash
+    docker_cmd exec -it "$(container_name "$name")" bash
 }
 
 cmd_exec() {
@@ -290,7 +300,7 @@ cmd_exec() {
         exit 1
     fi
 
-    $RDEV_DOCKER exec "$(container_name "$name")" "$@"
+    docker_cmd exec "$(container_name "$name")" "$@"
 }
 
 cmd_list() {
@@ -298,7 +308,7 @@ cmd_list() {
 
     # Get all rdev containers
     local containers
-    containers=$($RDEV_DOCKER ps -a --filter "name=^${RDEV_CONTAINER_PREFIX}-" --format '{{.Names}}\t{{.Status}}\t{{.State}}' 2>/dev/null)
+    containers=$(docker_cmd ps -a --filter "name=^${RDEV_CONTAINER_PREFIX}-" --format '{{.Names}}\t{{.Status}}\t{{.State}}' 2>/dev/null)
 
     if [ -z "$containers" ]; then
         info "No projects found. Create one with: $0 create <name>"
@@ -339,11 +349,11 @@ cmd_status() {
 
     # Container info
     local state
-    state=$($RDEV_DOCKER container inspect -f '{{.State.Status}}' "$cname")
+    state=$(docker_cmd container inspect -f '{{.State.Status}}' "$cname")
     local started
-    started=$($RDEV_DOCKER container inspect -f '{{.State.StartedAt}}' "$cname" 2>/dev/null || echo "N/A")
+    started=$(docker_cmd container inspect -f '{{.State.StartedAt}}' "$cname" 2>/dev/null || echo "N/A")
     local image
-    image=$($RDEV_DOCKER container inspect -f '{{.Config.Image}}' "$cname")
+    image=$(docker_cmd container inspect -f '{{.Config.Image}}' "$cname")
 
     echo -e "  ${BOLD}Container:${NC}  $cname"
     echo -e "  ${BOLD}State:${NC}      $state"
@@ -352,7 +362,7 @@ cmd_status() {
 
     # Check GPU
     local gpu_flag
-    gpu_flag=$($RDEV_DOCKER container inspect -f '{{range .HostConfig.DeviceRequests}}{{.Driver}}{{end}}' "$cname" 2>/dev/null)
+    gpu_flag=$(docker_cmd container inspect -f '{{range .HostConfig.DeviceRequests}}{{.Driver}}{{end}}' "$cname" 2>/dev/null)
     if [ -n "$gpu_flag" ]; then
         echo -e "  ${BOLD}GPU:${NC}        ${GREEN}enabled${NC}"
     else
@@ -375,7 +385,7 @@ cmd_status() {
     if container_running "$name"; then
         echo ""
         local git_status
-        git_status=$($RDEV_DOCKER exec "$cname" bash -c "cd /workspace && git status --short 2>/dev/null || echo '(not a git repo)'" 2>/dev/null)
+        git_status=$(docker_cmd exec "$cname" bash -c "cd /workspace && git status --short 2>/dev/null || echo '(not a git repo)'" 2>/dev/null)
         echo -e "  ${BOLD}Git:${NC}"
         if [ -z "$git_status" ]; then
             echo "    clean (no uncommitted changes)"
@@ -393,7 +403,7 @@ cmd_logs() {
         exit 1
     fi
 
-    $RDEV_DOCKER logs "$(container_name "$name")" "${@:2}"
+    docker_cmd logs "$(container_name "$name")" "${@:2}"
 }
 
 cmd_push() {
@@ -406,7 +416,7 @@ cmd_push() {
     fi
 
     info "Copying $local_path → container $(container_name "$name"):/workspace/"
-    $RDEV_DOCKER cp "$local_path" "$(container_name "$name"):/workspace/"
+    docker_cmd cp "$local_path" "$(container_name "$name"):/workspace/"
     success "Files copied"
 }
 
@@ -421,7 +431,7 @@ cmd_pull() {
     fi
 
     info "Copying container $(container_name "$name"):$remote_path → $dest"
-    $RDEV_DOCKER cp "$(container_name "$name"):$remote_path" "$dest"
+    docker_cmd cp "$(container_name "$name"):$remote_path" "$dest"
     success "Files copied"
 }
 
@@ -436,7 +446,7 @@ cmd_build() {
     fi
 
     info "Building image: $RDEV_IMAGE"
-    $RDEV_DOCKER build -t "$RDEV_IMAGE" "$docker_dir"
+    docker_cmd build -t "$RDEV_IMAGE" "$docker_dir"
     success "Image built: $RDEV_IMAGE"
 }
 
@@ -465,9 +475,10 @@ ${BOLD}Commands:${NC}
 
 ${BOLD}Configuration:${NC}
   Set these environment variables or use a .env file:
-    RDEV_DATA_DIR   Project data directory (default: ./data/projects)
-    RDEV_IMAGE      Docker image (default: rdev-base:latest)
-    RDEV_DOCKER     Docker binary (default: docker)
+    RDEV_DATA_DIR       Project data directory (default: ./data/projects)
+    RDEV_IMAGE          Docker image (default: rdev-base:latest)
+    RDEV_DOCKER         Docker binary (default: docker)
+    RDEV_DOCKER_CONTEXT Docker context (default: none, e.g. "rootless")
 
 EOF
 }
