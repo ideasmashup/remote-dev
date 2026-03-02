@@ -1,44 +1,541 @@
-#!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════════════
-# rdev — Local developer CLI for Remote Dev
-#
-# Thin wrapper that calls remote-dev.sh either directly (local mode)
-# or via SSH (remote mode).
-# ═══════════════════════════════════════════════════════════════════════════════
-set -euo pipefail
+#!/usr/bin/env python3
+"""
+rdev — Remote Dev CLI
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+Manages named Python project containers on a shared host.
+Runs locally (routing commands via SSH) or directly on the server.
 
-# Load .env if present
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env"
-fi
+Usage:
+    ./rdev <command> [options]
+    ./rdev --help
+"""
 
-RDEV_HOST="${RDEV_HOST:-local}"
-RDEV_REMOTE_SCRIPT="${RDEV_REMOTE_SCRIPT:-/opt/remote-dev/remote-dev.sh}"
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
 
-if [ $# -eq 0 ]; then
-    echo "Usage: rdev <command> [options]"
-    echo ""
-    echo "Run 'rdev help' for available commands."
-    echo ""
-    echo "Mode: ${RDEV_HOST}"
-    exit 0
-fi
+# ── Configuration ────────────────────────────────────────────────────────────
 
-if [ "$RDEV_HOST" = "local" ]; then
-    # ── Local mode: call remote-dev.sh directly ──
-    exec "$SCRIPT_DIR/remote-dev.sh" "$@"
-else
-    # ── Remote mode: call remote-dev.sh via SSH ──
-    # For interactive commands (shell), allocate a TTY
-    ssh_args=()
-    case "${1:-}" in
-        shell)
-            ssh_args+=("-t")  # Force TTY allocation
-            ;;
-    esac
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-    exec ssh "${ssh_args[@]}" "$RDEV_HOST" "$RDEV_REMOTE_SCRIPT" "$@"
-fi
+def load_env(env_file: Path) -> dict:
+    """Load a .env file into a dict (simple KEY=VALUE parser)."""
+    env = {}
+    if not env_file.exists():
+        return env
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip()
+    return env
+
+# Load .env
+_env = load_env(SCRIPT_DIR / ".env")
+
+RDEV_DATA_DIR = Path(os.environ.get("RDEV_DATA_DIR", _env.get("RDEV_DATA_DIR", str(SCRIPT_DIR / "data" / "projects"))))
+RDEV_IMAGE = os.environ.get("RDEV_IMAGE", _env.get("RDEV_IMAGE", "rdev-base:latest"))
+RDEV_DOCKER = os.environ.get("RDEV_DOCKER", _env.get("RDEV_DOCKER", "docker"))
+RDEV_DOCKER_CONTEXT = os.environ.get("RDEV_DOCKER_CONTEXT", _env.get("RDEV_DOCKER_CONTEXT", ""))
+RDEV_HOST = os.environ.get("RDEV_HOST", _env.get("RDEV_HOST", "local"))
+RDEV_REMOTE_SCRIPT = os.environ.get("RDEV_REMOTE_SCRIPT", _env.get("RDEV_REMOTE_SCRIPT", "/opt/remote-dev/rdev"))
+RDEV_CONTAINER_PREFIX = "rdev"
+RDEV_TEMPLATES_DIR = Path(os.environ.get("RDEV_TEMPLATES_DIR", _env.get("RDEV_TEMPLATES_DIR", str(SCRIPT_DIR / "templates"))))
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+
+class C:
+    """ANSI color codes."""
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[0;34m"
+    CYAN = "\033[0;36m"
+    BOLD = "\033[1m"
+    NC = "\033[0m"
+
+def info(msg):    print(f"{C.BLUE}ℹ{C.NC}  {msg}")
+def success(msg): print(f"{C.GREEN}✅{C.NC} {msg}")
+def warn(msg):    print(f"{C.YELLOW}⚠️{C.NC}  {msg}")
+def error(msg):   print(f"{C.RED}❌{C.NC} {msg}", file=sys.stderr)
+def header(msg):  print(f"\n{C.BOLD}{C.CYAN}═══ {msg} ═══{C.NC}\n")
+
+# ── Docker helpers ───────────────────────────────────────────────────────────
+
+def docker_cmd(*args, capture=False, check=True, quiet=False, interactive=False):
+    """Run a docker command, injecting --context if configured."""
+    cmd = [RDEV_DOCKER]
+    if RDEV_DOCKER_CONTEXT:
+        cmd += ["--context", RDEV_DOCKER_CONTEXT]
+    cmd += list(args)
+
+    if interactive:
+        # For interactive commands (shell), don't capture output
+        result = subprocess.run(cmd)
+        if check and result.returncode != 0:
+            sys.exit(result.returncode)
+        return result
+
+    if capture:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if check and result.returncode != 0:
+            if not quiet:
+                error(f"Docker command failed: {' '.join(cmd)}")
+                if result.stderr:
+                    print(result.stderr, file=sys.stderr)
+            if check:
+                sys.exit(result.returncode)
+        return result
+    else:
+        result = subprocess.run(cmd)
+        if check and result.returncode != 0:
+            sys.exit(result.returncode)
+        return result
+
+def container_name(project: str) -> str:
+    return f"{RDEV_CONTAINER_PREFIX}-{project}"
+
+def project_dir(project: str) -> Path:
+    return RDEV_DATA_DIR / project
+
+def container_exists(project: str) -> bool:
+    result = docker_cmd("container", "inspect", container_name(project),
+                        capture=True, check=False, quiet=True)
+    return result.returncode == 0
+
+def container_running(project: str) -> bool:
+    result = docker_cmd("container", "inspect", "-f", "{{.State.Running}}",
+                        container_name(project), capture=True, check=False, quiet=True)
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_build(args):
+    """Build the base Docker image."""
+    header("Building Remote Dev base image")
+    docker_dir = SCRIPT_DIR / "docker"
+    dockerfile = docker_dir / "Dockerfile"
+
+    if not dockerfile.exists():
+        error(f"Dockerfile not found at {dockerfile}")
+        sys.exit(1)
+
+    info(f"Building image: {RDEV_IMAGE}")
+    docker_cmd("build", "-t", RDEV_IMAGE, str(docker_dir))
+    success(f"Image built: {RDEV_IMAGE}")
+
+
+def cmd_create(args):
+    """Create a new project container."""
+    name = args.name
+    gpu = args.gpu
+    git_url = args.git_url
+
+    header(f"Creating project: {name}")
+
+    if container_exists(name):
+        error(f"Project '{name}' already exists. Use 'destroy' first or choose a different name.")
+        sys.exit(1)
+
+    # Create project data directory
+    proj = project_dir(name)
+    proj.mkdir(parents=True, exist_ok=True)
+    info(f"Created project directory: {proj}")
+
+    # Copy template files (only when not cloning a repo)
+    if not git_url and RDEV_TEMPLATES_DIR.is_dir():
+        agent_tpl = RDEV_TEMPLATES_DIR / "AGENT.md"
+        readme_tpl = RDEV_TEMPLATES_DIR / "README.md"
+        if agent_tpl.exists():
+            shutil.copy2(agent_tpl, proj / "AGENT.md")
+        if readme_tpl.exists():
+            content = readme_tpl.read_text()
+            content = content.replace("{{PROJECT_NAME}}", name)
+            content = content.replace("{{DATE}}", date.today().isoformat())
+            (proj / "README.md").write_text(content)
+        info("Copied template files")
+
+    # Build docker run arguments
+    cname = container_name(name)
+    docker_args = [
+        "run", "-d",
+        "--name", cname,
+        "--hostname", name,
+        "-e", f"RDEV_PROJECT_NAME={name}",
+        "-v", f"{proj}:/workspace",
+        "--restart", "unless-stopped",
+    ]
+    if gpu:
+        docker_args += ["--gpus", "all"]
+        info("GPU access enabled")
+    docker_args.append(RDEV_IMAGE)
+
+    info(f"Creating container: {cname}")
+    docker_cmd(*docker_args)
+
+    # Clone git repo inside the container if requested
+    if git_url:
+        info(f"Cloning repository: {git_url}")
+        clone_script = (
+            f"cd /workspace && "
+            f"git clone '{git_url}' /tmp/_rdev_clone && "
+            f"shopt -s dotglob && "
+            f"mv /tmp/_rdev_clone/* /workspace/ 2>/dev/null || true && "
+            f"rm -rf /tmp/_rdev_clone"
+        )
+        docker_cmd("exec", cname, "bash", "-c", clone_script)
+        # Inject AGENT.md into cloned projects too
+        agent_tpl = RDEV_TEMPLATES_DIR / "AGENT.md"
+        if agent_tpl.exists():
+            docker_cmd("cp", str(agent_tpl), f"{cname}:/workspace/AGENT.md")
+        success("Repository cloned into workspace")
+
+    success(f"Project '{name}' created and running!")
+    print()
+    print(f"  Shell into it:   ./rdev shell {name}")
+    print(f"  Run a command:   ./rdev exec {name} <command>")
+    print(f"  Project status:  ./rdev status {name}")
+
+
+def cmd_destroy(args):
+    """Destroy a project container and its data."""
+    name = args.name
+
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+
+    if not args.yes:
+        answer = input(f"Are you sure you want to destroy project '{name}'? "
+                       f"This will remove the container AND all project data. [y/N] ")
+        if answer.lower() != "y":
+            info("Cancelled")
+            return
+
+    header(f"Destroying project: {name}")
+
+    cname = container_name(name)
+    docker_cmd("rm", "-f", cname, capture=True, check=False, quiet=True)
+    success("Container removed")
+
+    proj = project_dir(name)
+    if proj.is_dir():
+        shutil.rmtree(proj)
+        success(f"Project data removed: {proj}")
+
+    success(f"Project '{name}' destroyed")
+
+
+def cmd_start(args):
+    """Start a stopped project."""
+    name = args.name
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    if container_running(name):
+        warn(f"Project '{name}' is already running")
+        return
+    info(f"Starting project '{name}'...")
+    docker_cmd("start", container_name(name))
+    success(f"Project '{name}' started")
+
+
+def cmd_stop(args):
+    """Stop a running project."""
+    name = args.name
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    if not container_running(name):
+        warn(f"Project '{name}' is not running")
+        return
+    info(f"Stopping project '{name}'...")
+    docker_cmd("stop", container_name(name))
+    success(f"Project '{name}' stopped")
+
+
+def cmd_shell(args):
+    """Open an interactive shell inside the project container."""
+    name = args.name
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    if not container_running(name):
+        error(f"Project '{name}' is not running. Start it first with: ./rdev start {name}")
+        sys.exit(1)
+    info(f"Opening shell for project '{name}'...")
+    docker_cmd("exec", "-it", container_name(name), "bash", interactive=True)
+
+
+def cmd_exec(args):
+    """Run a command inside the project container."""
+    name = args.name
+    cmd = args.cmd
+    if not cmd:
+        error("Command is required")
+        print("Usage: ./rdev exec <name> <command...>")
+        sys.exit(1)
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    if not container_running(name):
+        error(f"Project '{name}' is not running. Start it first with: ./rdev start {name}")
+        sys.exit(1)
+    docker_cmd("exec", container_name(name), *cmd)
+
+
+def cmd_list(args):
+    """List all projects."""
+    header("Remote Dev Projects")
+
+    result = docker_cmd("ps", "-a",
+                        "--filter", f"name=^{RDEV_CONTAINER_PREFIX}-",
+                        "--format", "{{.Names}}\t{{.Status}}\t{{.State}}",
+                        capture=True, check=False)
+
+    output = result.stdout.strip()
+    if not output:
+        info("No projects found. Create one with: ./rdev create <name>")
+        return
+
+    print(f"{C.BOLD}{'PROJECT':<20} {'STATE':<10} STATUS{C.NC}")
+    print(f"{'───────':<20} {'─────':<10} ──────")
+
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        cname, status, state = parts[0], parts[1], parts[2]
+        pname = cname.removeprefix(f"{RDEV_CONTAINER_PREFIX}-")
+        state_colored = f"{C.GREEN}{state}{C.NC}" if state == "running" else f"{C.YELLOW}{state}{C.NC}"
+        print(f"{pname:<20} {state_colored:<22} {status}")
+
+
+def cmd_status(args):
+    """Show detailed project status."""
+    name = args.name
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+
+    header(f"Project Status: {name}")
+
+    cname = container_name(name)
+
+    # Get container info via docker inspect (JSON)
+    result = docker_cmd("container", "inspect", cname, capture=True)
+    info_list = json.loads(result.stdout)
+    if not info_list:
+        error("Could not inspect container")
+        sys.exit(1)
+    ci = info_list[0]
+
+    state = ci["State"]["Status"]
+    started = ci["State"].get("StartedAt", "N/A")
+    image = ci["Config"]["Image"]
+
+    print(f"  {C.BOLD}Container:{C.NC}  {cname}")
+    print(f"  {C.BOLD}State:{C.NC}      {state}")
+    print(f"  {C.BOLD}Started:{C.NC}    {started}")
+    print(f"  {C.BOLD}Image:{C.NC}      {image}")
+
+    # GPU check
+    device_requests = ci.get("HostConfig", {}).get("DeviceRequests")
+    if device_requests:
+        print(f"  {C.BOLD}GPU:{C.NC}        {C.GREEN}enabled{C.NC}")
+    else:
+        print(f"  {C.BOLD}GPU:{C.NC}        {C.YELLOW}disabled{C.NC}")
+
+    # Data dir
+    proj = project_dir(name)
+    print(f"  {C.BOLD}Data dir:{C.NC}   {proj}")
+
+    # Disk usage
+    if proj.is_dir():
+        try:
+            size_result = subprocess.run(["du", "-sh", str(proj)],
+                                         capture_output=True, text=True)
+            size = size_result.stdout.split()[0] if size_result.stdout else "?"
+            print(f"  {C.BOLD}Disk:{C.NC}       {size}")
+        except Exception:
+            pass
+
+    # Git status
+    if container_running(name):
+        print()
+        git_result = docker_cmd("exec", cname, "bash", "-c",
+                                "cd /workspace && git status --short 2>/dev/null || echo '(not a git repo)'",
+                                capture=True, check=False)
+        git_out = git_result.stdout.strip()
+        print(f"  {C.BOLD}Git:{C.NC}")
+        if not git_out:
+            print("    clean (no uncommitted changes)")
+        else:
+            for line in git_out.splitlines():
+                print(f"    {line}")
+
+
+def cmd_logs(args):
+    """Show container logs."""
+    name = args.name
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    docker_cmd("logs", container_name(name))
+
+
+def cmd_push(args):
+    """Copy files into the project container."""
+    name = args.name
+    local_path = args.local_path
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    info(f"Copying {local_path} → container {container_name(name)}:/workspace/")
+    docker_cmd("cp", local_path, f"{container_name(name)}:/workspace/")
+    success("Files copied")
+
+
+def cmd_pull(args):
+    """Copy files from the project container."""
+    name = args.name
+    remote_path = args.remote_path
+    dest = args.dest or "."
+    if not container_exists(name):
+        error(f"Project '{name}' does not exist")
+        sys.exit(1)
+    info(f"Copying container {container_name(name)}:{remote_path} → {dest}")
+    docker_cmd("cp", f"{container_name(name)}:{remote_path}", dest)
+    success("Files copied")
+
+
+# ── SSH Remote Routing ───────────────────────────────────────────────────────
+
+def run_via_ssh(argv: list[str]):
+    """Route the entire command to the remote host via SSH."""
+    ssh_cmd = ["ssh"]
+
+    # Allocate TTY for interactive commands
+    if argv and argv[0] == "shell":
+        ssh_cmd.append("-t")
+
+    ssh_cmd += [RDEV_HOST, RDEV_REMOTE_SCRIPT] + argv
+    result = subprocess.run(ssh_cmd)
+    sys.exit(result.returncode)
+
+
+# ── CLI Parser ───────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="rdev",
+        description="Remote Dev — Project container management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # build
+    sub.add_parser("build", help="Build the base Docker image")
+
+    # create
+    p = sub.add_parser("create", help="Create a new project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("--gpu", action="store_true", help="Enable GPU access")
+    p.add_argument("--no-gpu", action="store_true", help="Disable GPU access (default)")
+    p.add_argument("--git-url", help="Git repository URL to clone")
+
+    # destroy
+    p = sub.add_parser("destroy", help="Remove project and data")
+    p.add_argument("name", help="Project name")
+    p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
+    # start
+    p = sub.add_parser("start", help="Start a stopped project")
+    p.add_argument("name", help="Project name")
+
+    # stop
+    p = sub.add_parser("stop", help="Stop a running project")
+    p.add_argument("name", help="Project name")
+
+    # shell
+    p = sub.add_parser("shell", help="Open a shell in the project")
+    p.add_argument("name", help="Project name")
+
+    # exec
+    p = sub.add_parser("exec", help="Run a command in the project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run")
+
+    # list
+    sub.add_parser("list", help="List all projects")
+
+    # status
+    p = sub.add_parser("status", help="Show project details")
+    p.add_argument("name", help="Project name")
+
+    # logs
+    p = sub.add_parser("logs", help="Show container logs")
+    p.add_argument("name", help="Project name")
+
+    # push
+    p = sub.add_parser("push", help="Copy files into project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("local_path", help="Local file or directory path")
+
+    # pull
+    p = sub.add_parser("pull", help="Copy files from project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("remote_path", help="Path inside container")
+    p.add_argument("dest", nargs="?", default=".", help="Local destination (default: .)")
+
+    return parser
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+COMMAND_MAP = {
+    "build":   cmd_build,
+    "create":  cmd_create,
+    "destroy": cmd_destroy,
+    "start":   cmd_start,
+    "stop":    cmd_stop,
+    "shell":   cmd_shell,
+    "exec":    cmd_exec,
+    "list":    cmd_list,
+    "status":  cmd_status,
+    "logs":    cmd_logs,
+    "push":    cmd_push,
+    "pull":    cmd_pull,
+}
+
+def main():
+    # If running in remote mode, route everything via SSH
+    if RDEV_HOST != "local":
+        run_via_ssh(sys.argv[1:])
+        return  # unreachable, run_via_ssh calls sys.exit
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    handler = COMMAND_MAP.get(args.command)
+    if handler:
+        handler(args)
+    else:
+        error(f"Unknown command: {args.command}")
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

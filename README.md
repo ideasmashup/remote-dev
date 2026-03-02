@@ -7,7 +7,7 @@ A system to let developers and LLMs work on Python projects inside remote Linux 
 ```mermaid
 graph TD
     DEV["Developer Machine"] -->|"rdev create/shell/push/..."| RDEV["rdev CLI"]
-    RDEV -->|"Local: direct call"| REMOTE_DEV["remote-dev.sh on Host"]
+    RDEV -->|"Local: direct call"| REMOTE_DEV["rdev on Host"]
     RDEV -->|"Remote: SSH"| REMOTE_DEV
     REMOTE_DEV -->|"docker create/start/exec"| CONTAINER["Project Container"]
     CONTAINER -->|"Persistent volume"| STORAGE["/data/projects/PROJECT_NAME"]
@@ -17,8 +17,7 @@ graph TD
 | Concept | Description |
 |---------|-------------|
 | **Project** | A named unit of work = 1 Docker container + 1 persistent volume |
-| **remote-dev.sh** | Server-side script that manages containers (create, start, stop, shell, list, destroy, etc.) |
-| **rdev** | Local CLI wrapper — calls `remote-dev.sh` directly (local) or via SSH (remote) |
+| **rdev** | Python CLI — runs Docker commands directly (local) or routes via SSH (remote) |
 | **Project Volume** | Bind mount on host → `/workspace` inside container |
 
 ## Main Capabilities
@@ -90,8 +89,7 @@ You must have a working SSH access to the remote host, with git and docker insta
 ```
 remote-dev/
 ├── README.md                # This file
-├── remote-dev.sh            # Server-side management script
-├── rdev                     # Local developer CLI
+├── rdev                     # CLI script (Python 3, no dependencies)
 ├── .env.example             # Configuration template
 ├── docker/
 │   ├── Dockerfile           # Base container image (Ubuntu 22.04 + Python + git)
@@ -148,5 +146,5 @@ Tests the full lifecycle: build → create → templates → exec → persistenc
 2. SSH into the server and clone it
 3. Copy `.env.example` → `.env`, set `RDEV_DATA_DIR` to an absolute path (e.g. `/data/projects`)
 4. Update `docker/Dockerfile` base image to `nvidia/cuda:12.1.0-devel-ubuntu22.04`
-5. Run `./remote-dev.sh build` on the server
+5. Run `./rdev build` on the server
 6. Locally, set `RDEV_HOST=user@server` in `.env` to use SSH mode via `rdev`

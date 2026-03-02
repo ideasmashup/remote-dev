@@ -6,7 +6,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RDEV="$PROJECT_DIR/remote-dev.sh"
+RDEV="$PROJECT_DIR/rdev"
+
+# Force local mode for tests (override .env which may have RDEV_HOST=h100)
+export RDEV_HOST=local
+export RDEV_DOCKER_CONTEXT=
+export RDEV_DATA_DIR="$PROJECT_DIR/data/projects"
 
 # ── Test framework ───────────────────────────────────────────────────────────
 
