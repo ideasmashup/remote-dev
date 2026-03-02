@@ -115,6 +115,20 @@ def container_running(project: str) -> bool:
                         container_name(project), capture=True, check=False, quiet=True)
     return result.returncode == 0 and result.stdout.strip() == "true"
 
+def _inject_file_into_container(cname: str, local_file: Path, container_path: str):
+    """Write a local file into a container via docker exec + stdin.
+    
+    This avoids rootless Docker permission issues with 'docker cp' on
+    bind-mounted volumes, because the file is written from inside the
+    container with the container's UID.
+    """
+    content = local_file.read_text()
+    cmd = [RDEV_DOCKER]
+    if RDEV_DOCKER_CONTEXT:
+        cmd += ["--context", RDEV_DOCKER_CONTEXT]
+    cmd += ["exec", "-i", cname, "tee", container_path]
+    subprocess.run(cmd, input=content, text=True, stdout=subprocess.DEVNULL, check=True)
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_build(args):
@@ -191,10 +205,11 @@ def cmd_create(args):
             f"rm -rf /tmp/_rdev_clone"
         )
         docker_cmd("exec", cname, "bash", "-c", clone_script)
-        # Inject AGENT.md into cloned projects too
+        # Inject AGENT.md into cloned projects too (use exec+stdin to avoid
+        # rootless Docker permission issues with docker cp on bind mounts)
         agent_tpl = RDEV_TEMPLATES_DIR / "AGENT.md"
         if agent_tpl.exists():
-            docker_cmd("cp", str(agent_tpl), f"{cname}:/workspace/AGENT.md")
+            _inject_file_into_container(cname, agent_tpl, "/workspace/AGENT.md")
         success("Repository cloned into workspace")
 
     success(f"Project '{name}' created and running!")
