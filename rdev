@@ -130,11 +130,11 @@ def _inject_file_into_container(cname: str, local_file: Path, container_path: st
     subprocess.run(cmd, input=content, text=True, stdout=subprocess.DEVNULL, check=True)
 
 def _fix_rootless_ownership(path: Path):
-    """Fix directory ownership for rootless Docker bind mounts.
+    """Fix directory permissions for rootless Docker bind mounts.
     
     Rootless Docker maps container root (UID 0) to a subordinate UID
-    on the host (e.g. 362144). Bind-mounted dirs must be owned by this
-    remapped UID for the container to write to them.
+    on the host. Since we can't chown without root, we make the directory
+    world-writable so the remapped UID can write to it.
     
     Only applies when RDEV_DOCKER_CONTEXT is set and /etc/subuid exists.
     """
@@ -145,24 +145,11 @@ def _fix_rootless_ownership(path: Path):
     if not subuid_file.exists():
         return  # Not on Linux or no subuid configured (e.g. macOS)
     
-    # Get current user
-    import getpass
-    username = getpass.getuser()
-    
-    # Parse /etc/subuid to find the subordinate UID range
-    # Format: username:start_uid:count
-    for line in subuid_file.read_text().splitlines():
-        parts = line.strip().split(":")
-        if len(parts) >= 2 and parts[0] == username:
-            sub_uid = int(parts[1])
-            info(f"Rootless Docker: chown {path} to UID {sub_uid} (from /etc/subuid)")
-            try:
-                os.chown(path, sub_uid, sub_uid)
-            except PermissionError:
-                warn(f"Could not chown {path} — you may need to run: sudo chown {sub_uid}:{sub_uid} {path}")
-            return
-    
-    warn("Could not determine rootless Docker UID mapping from /etc/subuid")
+    info(f"Rootless Docker: setting {path} permissions for bind mount access")
+    try:
+        os.chmod(path, 0o777)
+    except PermissionError:
+        warn(f"Could not chmod {path} — container may not be able to write to workspace")
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
