@@ -129,6 +129,41 @@ def _inject_file_into_container(cname: str, local_file: Path, container_path: st
     cmd += ["exec", "-i", cname, "tee", container_path]
     subprocess.run(cmd, input=content, text=True, stdout=subprocess.DEVNULL, check=True)
 
+def _fix_rootless_ownership(path: Path):
+    """Fix directory ownership for rootless Docker bind mounts.
+    
+    Rootless Docker maps container root (UID 0) to a subordinate UID
+    on the host (e.g. 362144). Bind-mounted dirs must be owned by this
+    remapped UID for the container to write to them.
+    
+    Only applies when RDEV_DOCKER_CONTEXT is set and /etc/subuid exists.
+    """
+    if not RDEV_DOCKER_CONTEXT:
+        return  # Standard Docker, no remapping
+    
+    subuid_file = Path("/etc/subuid")
+    if not subuid_file.exists():
+        return  # Not on Linux or no subuid configured (e.g. macOS)
+    
+    # Get current user
+    import getpass
+    username = getpass.getuser()
+    
+    # Parse /etc/subuid to find the subordinate UID range
+    # Format: username:start_uid:count
+    for line in subuid_file.read_text().splitlines():
+        parts = line.strip().split(":")
+        if len(parts) >= 2 and parts[0] == username:
+            sub_uid = int(parts[1])
+            info(f"Rootless Docker: chown {path} to UID {sub_uid} (from /etc/subuid)")
+            try:
+                os.chown(path, sub_uid, sub_uid)
+            except PermissionError:
+                warn(f"Could not chown {path} — you may need to run: sudo chown {sub_uid}:{sub_uid} {path}")
+            return
+    
+    warn("Could not determine rootless Docker UID mapping from /etc/subuid")
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_build(args):
@@ -162,6 +197,10 @@ def cmd_create(args):
     proj = project_dir(name)
     proj.mkdir(parents=True, exist_ok=True)
     info(f"Created project directory: {proj}")
+
+    # Fix ownership for rootless Docker — the container's root UID is remapped
+    # to a subordinate UID on the host. We need the project dir owned by that UID.
+    _fix_rootless_ownership(proj)
 
     # Copy template files (only when not cloning a repo)
     if not git_url and RDEV_TEMPLATES_DIR.is_dir():
